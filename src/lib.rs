@@ -11,6 +11,7 @@ pub fn compile() {
     fs::remove_dir_all("public").unwrap_or_default();
     fs::create_dir_all("public").unwrap();
     fs::create_dir_all("include").unwrap();
+    fs::create_dir_all("embed").unwrap();
     copy_dir("include", "public").unwrap();
 
     let mut embed = HashMap::new();

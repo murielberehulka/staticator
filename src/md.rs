@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     fmt, fs,
     io::Write,
-    path::{self, PathBuf},
+    path::{self, Path, PathBuf},
     sync::{atomic::AtomicU16, Arc},
 };
 
@@ -14,6 +14,7 @@ struct Element {
     pub attrs: String,
     pub content: Option<String>,
     pub children: Vec<Element>,
+    pub self_close: bool,
 }
 
 impl fmt::Display for Element {
@@ -52,8 +53,10 @@ impl fmt::Display for Element {
                             self.content.as_ref().unwrap()
                         )
                         .unwrap();
-                    } else {
+                    } else if self.self_close {
                         write!(f, "{}<{}{}", tabs, name, self.attrs,).unwrap();
+                    } else {
+                        write!(f, "{}<{}{}>", tabs, name, self.attrs).unwrap();
                     }
                 }
                 for c in &self.children {
@@ -68,13 +71,15 @@ impl fmt::Display for Element {
                 } else {
                     if has_children {
                         write!(f, "{}</{}>", tabs, name).unwrap();
-                    } else {
+                    } else if self.self_close {
                         write!(f, "/>").unwrap();
+                    } else {
+                        write!(f, "</{}>", name).unwrap();
                     }
                 }
             }
             None => {
-                write!(f, "{}{}<br>", tabs, self.content.as_ref().unwrap()).unwrap();
+                write!(f, "{}{}", tabs, self.content.as_ref().unwrap()).unwrap();
             }
         }
         Ok(())
@@ -104,8 +109,9 @@ pub fn folder(
 
 fn parse(lines: Vec<String>) -> Vec<Element> {
     let mut e = vec![];
+    let mut padding = 0;
     for line in lines {
-        println!("'{}'", line);
+        //println!("'{}'", line);
         if line.len() == 0 {
             continue;
         }
@@ -116,12 +122,35 @@ fn parse(lines: Vec<String>) -> Vec<Element> {
             l += 4;
         }
 
+        let mut self_close = true;
         let words: Vec<&str> = line.split(' ').collect();
         if words.len() < 1 {
             continue;
         }
+        let mut classes = vec![];
         let name = if words[0].starts_with('>') {
-            Some(words[0].trim_start_matches('>').to_string())
+            match words[0] {
+                ">code_padding_right" => {
+                    padding += 1;
+                    continue;
+                }
+                ">code_padding_left" => {
+                    padding -= 1;
+                    continue;
+                }
+                _ => {}
+            };
+            let name = words[0].trim_start_matches('>').to_string();
+            if name.starts_with(".") {
+                classes.push(name.strip_prefix(".").unwrap().to_string());
+                self_close = false;
+                Some("div".to_string())
+            } else {
+                if name == "div" {
+                    self_close = false;
+                }
+                Some(name)
+            }
         } else {
             None
         };
@@ -134,23 +163,42 @@ fn parse(lines: Vec<String>) -> Vec<Element> {
         let mut attrs = Vec::new();
         while wi < ws {
             let mut values = Vec::new();
+            let mut close_after_quote = false;
             while wi < ws {
-                values.push(words[wi]);
-                if let Some(_) = words[wi].find('"') {
+                if words[wi].starts_with("roc=") {
+                    let mut new = words[wi].replace("roc=", "onclick=\"window.location='");
+                    new.push_str("'\"");
+                    attrs.push(new);
                     break;
+                }
+                values.push(words[wi].to_string());
+                if close_after_quote && words[wi].contains("\"") {
+                    break;
+                } else if words[wi].contains("=\"") {
+                    close_after_quote = true;
+                    if words[wi].matches('"').count() > 1 {
+                        break;
+                    }
                 }
                 wi += 1;
             }
+            //println!("values: '{:?}'", values);
             let values = values.join(" ");
-            match values.find("=\"") {
-                Some(_) => attrs.push(values),
-                None => contents.push(values),
+            if close_after_quote {
+                attrs.push(values);
+                //println!("attr");
+            } else {
+                //println!("content");
+                contents.push(values);
             }
             wi += 1;
         }
+        if classes.len() > 0 {
+            attrs.push(format!("class=\"{}\"", classes.join(",")).to_string());
+        }
         let element = Element {
             name,
-            level: l / 4,
+            level: (l / 4) + padding,
             attrs: if attrs.len() > 0 {
                 ([String::from(" "), attrs.join(" ")]).into_iter().collect()
             } else {
@@ -162,11 +210,12 @@ fn parse(lines: Vec<String>) -> Vec<Element> {
                 None
             },
             children: vec![],
+            self_close,
         };
         if l == 0 {
             e.push(element);
         } else {
-            get_element_in_level(&mut e, l / TAB_SIZE)
+            get_element_in_level(&mut e, (l / TAB_SIZE) + padding)
                 .children
                 .push(element);
         }
@@ -175,11 +224,149 @@ fn parse(lines: Vec<String>) -> Vec<Element> {
 }
 
 pub fn file(path: PathBuf, embed: Arc<HashMap<String, Vec<String>>>) {
-    println!("Compiling md file: {}", path.display());
     let mut variables = HashMap::<String, String>::new();
     let data = fs::read_to_string(&path).unwrap();
-    let mut lines = Vec::new();
-    for line_raw in data.split('\n') {
+    let mut lines = vec![];
+    let raw_lines: Vec<&str> = data.split('\n').collect();
+
+    let rll = raw_lines.len();
+    let mut rli = 0;
+    while rli < rll {
+        let line = &raw_lines[rli];
+        if line.starts_with("for_each_folder") {
+            let path: Vec<&str> = line.split("=").collect();
+            let path = path[1];
+            let mut folders = vec![];
+            match fs::read_dir(path) {
+                Ok(dir) => {
+                    for entry in dir {
+                        let entry = entry.unwrap();
+                        let path = entry.path();
+                        if path.is_dir() {
+                            let settings_file = fs::read_to_string(
+                                Path::new(&path.display().to_string()).join(Path::new("env.conf")),
+                            );
+                            let mut settings = HashMap::new();
+                            settings.insert(
+                                "url".to_string(),
+                                path.strip_prefix("include").unwrap().display().to_string(),
+                            );
+                            if let Ok(settings_file) = settings_file {
+                                for line in settings_file.split('\n') {
+                                    let args: Vec<&str> = line.split("=").collect();
+                                    if args.len() != 2 {
+                                        continue;
+                                    }
+                                    settings.insert(args[0].to_string(), args[1].to_string());
+                                }
+                            }
+                            folders.push(settings);
+                        }
+                    }
+                }
+                Err(e) => panic!("Error reading dir {}: {}", path, e),
+            }
+            let srli = rli + 1;
+            for folder in folders {
+                rli = srli;
+                while raw_lines[rli] != ";;;" {
+                    let mut line = raw_lines[rli].to_string();
+                    let mut print_line = true;
+                    // for_each_md_in_current_folder
+                    if line == "for_each_md_in_current_folder" {
+                        print_line = false;
+                        let current_folder =
+                            Path::new("include/").join(Path::new(folder.get("url").unwrap()));
+                        let files_raw = match fs::read_dir(&current_folder) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                panic!("Error reading dir '{}': '{}'", current_folder.display(), e)
+                            }
+                        };
+                        let mut files = vec![];
+                        for file in files_raw {
+                            let mut settings = HashMap::new();
+                            let path = file.unwrap().path();
+                            if !path.is_file() || path.extension().unwrap() != "md" {
+                                continue;
+                            }
+                            let content = fs::read_to_string(&path).unwrap();
+                            for line in content.split('\n') {
+                                if line.contains('=')
+                                    && !line.starts_with(' ')
+                                    && !line.starts_with('>')
+                                {
+                                    let spls: Vec<&str> = line.split('=').collect();
+                                    if spls.len() != 2 {
+                                        continue;
+                                    }
+                                    settings.insert(spls[0].to_string(), spls[1].to_string());
+                                }
+                            }
+                            settings.insert(
+                                "url".to_string(),
+                                path.strip_prefix("include")
+                                    .unwrap()
+                                    .with_extension("html")
+                                    .display()
+                                    .to_string(),
+                            );
+                            files.push(settings);
+                        }
+                        let smrli = rli + 1;
+                        for file in files {
+                            rli = smrli;
+                            while raw_lines[rli] != ";;;" {
+                                let mut line = raw_lines[rli].to_string();
+                                for spl in line.clone().split("{{") {
+                                    if spl.contains("}}") {
+                                        let var = spl.split("}}").next().unwrap();
+                                        if let Some(value) = file.get(var) {
+                                            line = line
+                                                .replace(
+                                                    &format!("{{{{{}}}}}", var.to_string())
+                                                        .to_string(),
+                                                    value,
+                                                )
+                                                .to_string();
+                                        }
+                                    }
+                                }
+                                lines.push(line);
+                                rli += 1;
+                            }
+                        }
+                    }
+                    if line.contains("{{") {
+                        for spl in line.clone().split("{{") {
+                            if spl.contains("}}") {
+                                let var = spl.split("}}").next().unwrap();
+                                if let Some(value) = folder.get(var) {
+                                    line = line
+                                        .replace(
+                                            &format!("{{{{{}}}}}", var.to_string()).to_string(),
+                                            value,
+                                        )
+                                        .to_string();
+                                }
+                            }
+                        }
+                    }
+                    if print_line {
+                        lines.push(line.to_string());
+                    }
+                    rli += 1;
+                }
+                rli += 1;
+            }
+        } else {
+            lines.push(line.to_string());
+        }
+        rli += 1;
+    }
+
+    let mut embeded_lines = vec![];
+    for line_raw in &lines {
         if line_raw.len() == 0 {
             continue;
         }
@@ -203,16 +390,16 @@ pub fn file(path: PathBuf, embed: Arc<HashMap<String, Vec<String>>>) {
                 //replace embeded line variables
                 for emb_line in emb_lines {
                     let replaced = replace_variables(&variables, emb_line.clone());
-                    lines.push(repeat_spaces(replaced, l));
+                    embeded_lines.push(repeat_spaces(replaced, l));
                 }
             }
         } else {
             let replaced = replace_variables(&variables, line.to_string());
-            lines.push(repeat_spaces(replaced, l));
+            embeded_lines.push(repeat_spaces(replaced, l));
         }
     }
 
-    let e = parse(lines);
+    let e = parse(embeded_lines);
 
     let path = path.strip_prefix("include").unwrap();
     let path = path::Path::new("public/").join(path.with_extension("html"));
@@ -223,7 +410,7 @@ pub fn file(path: PathBuf, embed: Arc<HashMap<String, Vec<String>>>) {
         .create(true)
         .open(path)
         .unwrap();
-    write!(file, "<!DOCTYPE html><html>\n").unwrap();
+    write!(file, "<!DOCTYPE html>\n<html>\n").unwrap();
     for e in e {
         write!(file, "{}\n", e).unwrap();
     }
